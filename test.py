@@ -331,6 +331,9 @@ for batch_x, batch_y in train_ds:
 
 # ========== MoE架构定义 ==========
 
+import shap
+from sklearn.inspection import permutation_importance
+from sklearn.metrics import mean_squared_error
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset
@@ -806,6 +809,208 @@ class MoESystem(nn.Module):
         return outputs, gate_decisions, gate_probs
 
 
+#计算原始特征的排列重要性(PFI)，分批预测并显示进度
+def compute_pfi_on_features(model, X, y, n_repeats=5, batch_size=256, sample_ratio=0.5, random_state=42):
+    np.random.seed(random_state)
+    n_samples, timesteps, n_features = X.shape
+    feature_names = XCOLS
+
+    # 子采样
+    if sample_ratio < 1.0:
+        n_use = int(n_samples * sample_ratio)
+        indices = np.random.choice(n_samples, n_use, replace=False)
+        X = X[indices]
+        y = y[indices]
+        n_samples = n_use
+        print(f"子采样到 {n_samples} 个样本用于 PFI")
+
+    # 分批预测，正确处理 MoESystem 返回值
+    def predict_in_batches(x):
+        x_tensor = torch.FloatTensor(x).to(device)
+        preds = []
+        for i in range(0, len(x_tensor), batch_size):
+            batch = x_tensor[i:i+batch_size]
+            with torch.no_grad():
+                outputs, _, _ = model(batch)  # 只取预测值
+            preds.append(outputs[:, 0].cpu().numpy())
+        return np.concatenate(preds)
+
+    # 基准预测
+    pred_base = predict_in_batches(X)
+    baseline_mse = np.mean((pred_base - y[:, 0]) ** 2)
+
+    importances = np.zeros(n_features)
+    stds = np.zeros(n_features)
+
+    # 带进度条的特征循环
+    for f_idx in tqdm(range(n_features), desc="计算 PFI"):
+        scores = []
+        for _ in range(n_repeats):
+            X_perm = X.copy()
+            perm_indices = np.random.permutation(n_samples)
+            X_perm[:, :, f_idx] = X_perm[perm_indices, :, f_idx]
+
+            pred_perm = predict_in_batches(X_perm)
+            mse_perm = np.mean((pred_perm - y[:, 0]) ** 2)
+            scores.append(mse_perm - baseline_mse)
+
+        importances[f_idx] = np.mean(scores)
+        stds[f_idx] = np.std(scores)
+
+    # 排序绘图
+    indices = np.argsort(importances)[::-1]
+    plt.figure(figsize=(10, 6))
+    plt.bar(range(len(indices)), importances[indices], yerr=stds[indices])
+    plt.xticks(range(len(indices)), [feature_names[i] for i in indices], rotation=45, ha='right')
+    plt.ylabel('Increase in MSE when feature permuted')
+    plt.title('Permutation Feature Importance (PFI) on Raw Features')
+    plt.tight_layout()
+    plt.savefig('pfi_raw_features.png', dpi=150)
+    plt.close()
+
+    print("\nPFI Top 10 features:")
+    for i in range(min(10, n_features)):
+        idx = indices[i]
+        print(f"{feature_names[idx]}: {importances[idx]:.6f} ± {stds[idx]:.6f}")
+
+    return importances, stds
+
+
+def analyze_event_shap(moe_system, test_sequences, test_labels, background_sequences,
+                       device, timesteps, feature_names, threshold=-50,
+                       event_start=0, event_end=None, top_k=6):    
+    """对指定时间段（连续样本）计算SHAP值，并绘制特征贡献的时间演化图"""
+    if event_end is None:
+        event_end = len(test_sequences)
+    X_event = torch.FloatTensor(test_sequences[event_start:event_end]).to(device)
+    y_event = test_labels[event_start:event_end]
+    T = X_event.shape[0]
+    print(f"\n事件时间段包含 {T} 个样本")
+
+    # 背景样本
+    bg_samples = torch.FloatTensor(background_sequences[:100]).to(device)
+
+    # 定义包装模型：只返回t0预测，保持二维输出
+    class WrappedModel(nn.Module):
+        def __init__(self, moe_system):
+            super().__init__()
+            self.moe_system = moe_system
+        def forward(self, x):
+            outputs, _, _ = self.moe_system(x, mode='adaptive')
+            return outputs[:, 0:1]  # shape (batch, 1)
+
+    wrapped_model = WrappedModel(moe_system).to(device)
+
+    # 创建解释器
+    explainer = shap.GradientExplainer(wrapped_model, bg_samples)
+
+    # 计算SHAP值
+    shap_values = explainer.shap_values(X_event, nsamples=200)
+    
+    if isinstance(shap_values, list):
+        shap_t0 = shap_values[0]
+    else:
+        shap_t0 = shap_values
+    if not isinstance(shap_t0, np.ndarray):
+        shap_t0 = shap_t0.cpu().numpy()
+    print(f"SHAP raw shape: {shap_t0.shape}")
+
+    # 如果 SHAP 值形状为 (T, timesteps, n_features, 1)，则压缩最后一维
+    if shap_t0.ndim == 4 and shap_t0.shape[-1] == 1:
+        shap_t0 = shap_t0.squeeze(-1)
+        print(f"After squeeze: {shap_t0.shape}")
+
+    # 检查形状是否符合预期 (T, timesteps, n_features)
+    if shap_t0.ndim == 3 and shap_t0.shape[1] == timesteps and shap_t0.shape[2] == len(feature_names):
+        contrib = shap_t0.sum(axis=1)  # (T, n_features)
+    else:
+        raise ValueError(f"Unexpected SHAP shape after processing: {shap_t0.shape}")
+
+    # 取每个时刻的当前特征值（最后一个时间步）
+    X_curr = X_event[:, -1, :].cpu().numpy()  # (T, n_features)
+
+    # 计算每个特征的平均绝对贡献，用于排序选择top_k
+    mean_abs_contrib = np.abs(contrib).mean(axis=0)
+    top_indices = np.argsort(mean_abs_contrib)[::-1][:top_k]
+
+    # 创建时间轴（小时索引）
+    time_axis = np.arange(T)
+
+    # 绘制子图：每个特征一行
+    fig, axes = plt.subplots(top_k, 1, figsize=(12, 3*top_k), sharex=True)
+    if top_k == 1:
+        axes = [axes]
+
+    # 记录颜色条的统一范围
+    vmax = np.abs(contrib).max()
+    vmin = -vmax
+
+    for i, idx in enumerate(top_indices):
+        ax = axes[i]
+        feat_name = feature_names[idx]
+        # 绘制特征值曲线
+        ax.plot(time_axis, X_curr[:, idx], color='black', linewidth=1, label=feat_name)
+        ax.set_ylabel(feat_name, color='black')
+        ax.tick_params(axis='y', labelcolor='black')
+        # 用颜色散点表示SHAP贡献
+        sc = ax.scatter(time_axis, X_curr[:, idx], c=contrib[:, idx], cmap='coolwarm',
+                        s=30, edgecolors='none', vmin=vmin, vmax=vmax)
+        ax.axhline(0, color='gray', linestyle='--', linewidth=0.5)
+        ax.grid(True, alpha=0.3)
+
+    # 添加颜色条
+    cbar = fig.colorbar(sc, ax=axes, orientation='vertical', fraction=0.02, pad=0.02)
+    cbar.set_label('SHAP contribution')
+
+    # 在另一个图中显示真实值和预测值的对比
+    with torch.no_grad():
+        pred, _, _ = moe_system(X_event, mode='adaptive')
+    pred_t0 = pred[:, 0].cpu().numpy()
+    true_t0 = y_event[:, 0]
+
+    fig2, ax2 = plt.subplots(figsize=(12, 3))
+    ax2.plot(time_axis, true_t0, label='True Dst', color='blue')
+    ax2.plot(time_axis, pred_t0, label='Pred Dst', color='red', linestyle='--')
+    ax2.set_xlabel('Time step (hour)')
+    ax2.set_ylabel('Dst (nT)')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    ax2.set_title('Dst Index during Event')
+    fig2.tight_layout()
+    fig2.savefig('event_dst.png', dpi=150)
+    plt.close(fig2)
+
+    plt.tight_layout()
+    plt.savefig('event_shap_evolution.png', dpi=150)
+    plt.close()
+    print("事件SHAP演化图已保存为 event_shap_evolution.png 和 event_dst.png")
+
+
+def select_event_window(test_labels, test_sequences, dst_lower=-200, dst_upper=-50, window_size=100, min_len=50):
+    """从测试集中随机选择一个满足 Dst 范围的事件窗口"""
+    dst_values = test_labels[:, 0]
+    mask = (dst_values > dst_lower) & (dst_values <= dst_upper)
+    candidate_indices = np.where(mask)[0]
+    if len(candidate_indices) == 0:
+        print(f"警告：未找到 Dst ∈ ({dst_lower}, {dst_upper}] 的事件，将选取 Dst > {dst_lower} 的样本")
+        mask = dst_values > dst_lower
+        candidate_indices = np.where(mask)[0]
+
+    np.random.shuffle(candidate_indices)
+    for idx in candidate_indices:
+        start = max(0, idx - window_size)
+        end = min(len(test_sequences), idx + window_size)
+        if end - start >= min_len:
+            return start, end
+
+    # 若所有候选窗口都太小，返回第一个候选（即使窗口小）
+    idx = candidate_indices[0]
+    start = max(0, idx - window_size)
+    end = min(len(test_sequences), idx + window_size)
+    print(f"警告：未找到足够大的窗口，使用索引 {idx}")
+    return start, end
+
+
 def load_all_models():
     """加载所有模型"""
     print("加载模型...")
@@ -1198,6 +1403,35 @@ def main():
 
     # 保存最终结果
     save_final_results(all_results, baseline_rmse=10.091585)
+
+    # 准备PFI测试数据（全部，非子集）
+    test_sequences, test_labels, _ = prepare_test_data(test)
+    compute_pfi_on_features(moe_system, test_sequences, test_labels, n_repeats=5, batch_size=256, sample_ratio=0.5)
+    
+    # 事件SHAP演化分析（随机选取一个中等或大磁暴事件，Dst > -200 nT）
+    # 检查是否已经存在背景数据，避免重复生成
+    if 'background_sequences' not in locals() and 'background_sequences' not in globals():
+        print("重新生成背景数据...")
+        train_sequences, _, _ = prepare_test_data(train)
+        bg_indices = np.random.choice(len(train_sequences), min(1000, len(train_sequences)), replace=False)
+        background_sequences = train_sequences[bg_indices]
+
+    selected_start, selected_end = select_event_window(test_labels, test_sequences)
+    print(f"选定事件：时间范围 [{selected_start}, {selected_end}]")
+
+    analyze_event_shap(
+        moe_system=moe_system,
+        test_sequences=test_sequences,
+        test_labels=test_labels,
+        background_sequences=background_sequences,
+        device=device,
+        timesteps=data_config["timesteps"],
+        feature_names=XCOLS,
+        threshold=-50,
+        event_start=selected_start,
+        event_end=selected_end,
+        top_k=6
+    )
 
 
 # 运行测试
